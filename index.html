@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Přetahovaná – Hopsárium</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;
+    user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;cursor:crosshair}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =========================================================
+   PŘETAHOVANÁ – dva týmy (levá a pravá polovina stěny)
+   Každý zásah Hopsáka na své polovině přetáhne lano k sobě.
+   Ovládání: dotyk / zásah míčkem = kliknutí (multitouch).
+   Klávesy (jen pro obsluhu): F = celá obrazovka, D = ladění
+   ========================================================= */
+
+/* ---------- NASTAVENÍ (lze upravit) ---------- */
+const CONFIG = {
+  roundSeconds: 75,       // délka kola
+  finaleSeconds: 15,      // posledních X sekund platí dvojnásobný tah
+  pull: 0.014,            // o kolik posune lano jeden zásah (1 = cesta od středu k cíli)
+  goldPull: 0.05,         // zlatý Hopsák
+  freezeSeconds: 2.5,     // jak dlouho je tým zmrazený po zásahu ledové koule
+  targetLife: 2.6,        // jak dlouho Hopsák vydrží na stěně (s)
+  perSide: 5,             // kolik Hopsáků najednou na jedné polovině
+  readyWait: 8,           // když je připravený jen jeden tým, hra začne po X sekundách
+  debounceMs: 150,        // ignorovat další zásah na stejném místě (odskok míčku)
+  debounceDist: 0.05,
+  endScreenSeconds: 12,
+  sound: true,
+  teams: [
+    { name: 'MODŘÍ',    color: '#1f6fff', light: '#7fb2ff' },
+    { name: 'ORANŽOVÍ', color: '#ff6a1a', light: '#ffb37f' }
+  ],
+  images: {
+    background: 'img/pozadi.jpg',
+    logo: 'img/logo.png',
+    hopsaci: [
+      ...[1, 2, 3, 4, 5, 6].map(n => 'img/maly' + n + '.png'),
+      ...[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map(n => 'img/stredni' + n + '.png')
+    ],
+    mascot: 'img/velky2.png'    // Hopsák v kruhu uprostřed lana
+  }
+};
+
+/* ---------- PLÁTNO ---------- */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H, U, DPR;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight; U = H / 100;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- OBRÁZKY ---------- */
+const IMG = {};
+function loadImg(key, src) { const i = new Image(); i.onload = () => IMG[key] = i; i.src = src; }
+loadImg('bg', CONFIG.images.background);
+loadImg('logo', CONFIG.images.logo);
+loadImg('mascot', CONFIG.images.mascot);
+CONFIG.images.hopsaci.forEach((s, i) => loadImg('h' + i, s));
+
+/* ---------- ZVUKY ---------- */
+let AC = null;
+function audioInit() {
+  if (!CONFIG.sound) return;
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (AC && AC.state === 'suspended') AC.resume();
+}
+function tone(f1, f2, dur, type = 'sine', vol = .2, delay = 0) {
+  if (!AC) return;
+  const t = AC.currentTime + delay, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f1, t); o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+  o.connect(g).connect(AC.destination); o.start(t); o.stop(t + dur + .02);
+}
+const lastSfx = [0, 0];
+const SFX = {
+  pop(side) { const n = performance.now(); if (n - lastSfx[side] < 45) return; lastSfx[side] = n;
+    const b = side ? 700 : 450; tone(b, b * 2.2, .1, 'square', .06); },
+  gold() { [880, 1175, 1568].forEach((f, i) => tone(f, f, .12, 'triangle', .15, i * .06)); },
+  freeze() { tone(1800, 300, .5, 'sine', .15); },
+  beep(f) { tone(f, f, .18, 'sine', .22); },
+  win() { [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, f, .3, 'triangle', .2, i * .14)); },
+  draw() { [523, 523, 392].forEach((f, i) => tone(f, f, .3, 'triangle', .18, i * .2)); }
+};
+
+/* ---------- STAV ---------- */
+let state = 'ready', stateT = 0;
+let rope, ropeShown, timeLeft, targets, hits, frozen, winner, ready, readySince, spawnT, finaleAnnounced;
+let parts = [], pops = [], ripples = [], recent = [], confetti = [];
+let debug = false;
+
+function resetReady() {
+  ready = [false, false]; readySince = 0; rope = 0; ropeShown = 0; targets = [];
+  setState('ready');
+}
+function setState(s) { state = s; stateT = 0; }
+function startGame() {
+  rope = 0; ropeShown = 0; timeLeft = CONFIG.roundSeconds; targets = []; hits = [0, 0];
+  frozen = [0, 0]; spawnT = 0; finaleAnnounced = false; winner = null; confetti = [];
+  setState('countdown');
+}
+const side = x => x < W / 2 ? 0 : 1;
+const finale = () => state === 'play' && timeLeft <= CONFIG.finaleSeconds;
+
+/* ---------- CÍLE (zrcadlově na obou polovinách = férové) ---------- */
+function spawnPair() {
+  const roll = Math.random();
+  const kind = roll < .1 ? 'gold' : roll < .18 ? 'ice' : 'normal';
+  const r = (kind === 'normal' ? 8.5 : 7.5) * U;
+  const minX = 3 * U + r, maxX = W / 2 - 7 * U - r, minY = 36 * U, maxY = 90 * U - r;
+  if (maxX <= minX) return;
+  for (let tries = 0; tries < 12; tries++) {
+    const x = minX + Math.random() * (maxX - minX), y = minY + Math.random() * (maxY - minY);
+    if (targets.some(t => t.side === 0 && Math.hypot(t.x - x, t.y - y) < (t.r + r) * 1.15)) continue;
+    const img = Math.floor(Math.random() * CONFIG.images.hopsaci.length);
+    const life = kind === 'gold' ? CONFIG.targetLife * .65 : CONFIG.targetLife;
+    for (const s of [0, 1])
+      targets.push({ side: s, x: s ? W - x : x, y, r, kind, img, age: 0, life, phase: Math.random() * 6, dead: false, flip: s === 1 });
+    return;
+  }
+}
+
+/* ---------- ZÁSAHY ---------- */
+function onHit(x, y) {
+  const now = performance.now();
+  recent = recent.filter(h => now - h.t < CONFIG.debounceMs);
+  if (recent.some(h => Math.hypot(h.x - x, h.y - y) < CONFIG.debounceDist * H)) return;
+  recent.push({ x, y, t: now });
+  ripples.push({ x, y, life: 1 });
+
+  if (state === 'ready') {
+    const s = side(x);
+    if (!ready[s]) { ready[s] = true; SFX.beep(s ? 880 : 660); burst(readyPos(s).x, readyPos(s).y, CONFIG.teams[s].color, 20);
+      if (!readySince) readySince = stateT; }
+    if (ready[0] && ready[1]) startGame();
+    return;
+  }
+  if (state === 'end') { if (stateT > 4) { resetReady(); SFX.beep(660); } return; }
+  if (state !== 'play') return;
+
+  const s = side(x);
+  if (frozen[s] > 0) return;
+  let best = null, bd = 1e9;
+  for (const t of targets) {
+    if (t.dead || t.side !== s) continue;
+    const d = Math.hypot(t.x - x, t.y - y) / t.r;
+    if (d < 1.3 && d < bd) { bd = d; best = t; }
+  }
+  if (!best) return;
+  best.dead = true;
+  const dir = s === 0 ? -1 : 1, mult = finale() ? 2 : 1;
+  if (best.kind === 'ice') {
+    frozen[s] = CONFIG.freezeSeconds; SFX.freeze();
+    burst(best.x, best.y, '#bfefff', 26);
+    pops.push({ x: best.x, y: best.y, text: 'BRRR!', life: 1.2, size: 7 * U, color: '#bfefff' });
+    return;
+  }
+  const amount = (best.kind === 'gold' ? CONFIG.goldPull : CONFIG.pull) * mult;
+  rope = Math.max(-1, Math.min(1, rope + dir * amount));
+  hits[s]++;
+  if (best.kind === 'gold') { SFX.gold(); burst(best.x, best.y, '#ffe14d', 30);
+    pops.push({ x: best.x, y: best.y, text: 'SUPER TAH!', life: 1.2, size: 6 * U, color: '#ffe14d' }); }
+  else { SFX.pop(s); burst(best.x, best.y, CONFIG.teams[s].light, 14);
+    pops.push({ x: best.x, y: best.y, text: mult > 1 ? 'TAH ×2' : 'TAH!', life: .8, size: 4.5 * U, color: '#fff' }); }
+  if (Math.abs(rope) >= 1) endGame(rope < 0 ? 0 : 1);
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.3, sp = (15 + Math.random() * 45) * U;
+    parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 15 * U, life: 1, r: (.6 + Math.random() * 1.4) * U, color });
+  }
+}
+
+function endGame(w) {
+  winner = w;
+  for (const t of targets) if (!t.dead) burst(t.x, t.y, '#fff', 6);
+  targets = [];
+  if (w === null) SFX.draw();
+  else {
+    SFX.win();
+    for (let i = 0; i < 160; i++) confetti.push({ x: (w ? W / 2 : 0) + Math.random() * W / 2, y: -Math.random() * H * .6,
+      vy: (15 + Math.random() * 25) * U, vx: (Math.random() - .5) * 10 * U, rot: Math.random() * 6, vr: (Math.random() - .5) * 8,
+      s: (1 + Math.random() * 1.5) * U, color: ['#ffe14d', '#ff5aa5', '#3ddc84', '#4cc9f0', CONFIG.teams[w].color][i % 5] });
+  }
+  setState('end');
+}
+
+/* ---------- AKTUALIZACE ---------- */
+function update(dt) {
+  stateT += dt;
+  if (state === 'ready' && readySince && stateT - readySince > CONFIG.readyWait) startGame();
+  if (state === 'countdown' && stateT >= 3.6) setState('play');
+
+  if (state === 'play') {
+    timeLeft -= dt;
+    if (!finaleAnnounced && finale()) {
+      finaleAnnounced = true; SFX.beep(990);
+      pops.push({ x: W / 2, y: 55 * U, text: 'FINÁLE – TAH ×2!', life: 2.2, size: 9 * U, color: '#ffe14d' });
+    }
+    for (const s of [0, 1]) if (frozen[s] > 0) frozen[s] -= dt;
+    spawnT -= dt;
+    const alive = targets.filter(t => !t.dead && t.side === 0).length;
+    if (spawnT <= 0 && alive < CONFIG.perSide) { spawnPair(); spawnT = (finale() ? .45 : .7) * (.7 + Math.random() * .6); }
+    if (timeLeft <= 0) {
+      timeLeft = 0;
+      endGame(Math.abs(rope) < 0.02 ? null : rope < 0 ? 0 : 1);
+    }
+  }
+  for (let i = targets.length - 1; i >= 0; i--) {
+    const t = targets[i]; t.age += dt; t.phase += dt * 3;
+    if (t.dead || t.age > t.life) { if (!t.dead) t.dead = true; t.out = (t.out || 0) + dt * 6; if (t.out >= 1) targets.splice(i, 1); }
+  }
+  ropeShown += (rope - ropeShown) * Math.min(1, dt * 8);
+
+  for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.vy += 70 * U * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt * 1.4; if (p.life <= 0) parts.splice(i, 1); }
+  for (let i = pops.length - 1; i >= 0; i--) { const p = pops[i]; p.y -= 8 * U * dt; p.life -= dt; if (p.life <= 0) pops.splice(i, 1); }
+  for (let i = ripples.length - 1; i >= 0; i--) { ripples[i].life -= dt * 2.5; if (ripples[i].life <= 0) ripples.splice(i, 1); }
+  for (const c of confetti) { c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt; }
+
+  if (state === 'end' && stateT > CONFIG.endScreenSeconds) resetReady();
+}
+
+/* ---------- KRESLENÍ ---------- */
+function text(str, x, y, size, color = '#fff', align = 'center') {
+  ctx.font = `700 ${size}px Fredoka, "Arial Rounded MT Bold", Arial, sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+  ctx.lineWidth = size * .18; ctx.strokeStyle = 'rgba(10,30,80,.85)'; ctx.strokeText(str, x, y);
+  ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+
+function drawBackground() {
+  if (IMG.bg) {
+    const s = Math.max(W / IMG.bg.width, H / IMG.bg.height);
+    ctx.drawImage(IMG.bg, (W - IMG.bg.width * s) / 2, H - IMG.bg.height * s, IMG.bg.width * s, IMG.bg.height * s);
+  } else {
+    const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#bfe6fb'); g.addColorStop(1, '#ffffff');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+  // barevné poloviny týmů
+  for (const s of [0, 1]) {
+    const g = ctx.createLinearGradient(s ? W : 0, 0, W / 2, 0);
+    g.addColorStop(0, CONFIG.teams[s].color + '55'); g.addColorStop(1, CONFIG.teams[s].color + '10');
+    ctx.fillStyle = g; ctx.fillRect(s ? W / 2 : 0, 0, W / 2, H);
+    if (frozen && frozen[s] > 0 && state === 'play') { ctx.fillStyle = 'rgba(200,240,255,.45)'; ctx.fillRect(s ? W / 2 : 0, 0, W / 2, H); }
+  }
+  ctx.setLineDash([2.5 * U, 2 * U]); ctx.strokeStyle = 'rgba(255,255,255,.9)'; ctx.lineWidth = .8 * U;
+  ctx.beginPath(); ctx.moveTo(W / 2, 34 * U); ctx.lineTo(W / 2, H); ctx.stroke(); ctx.setLineDash([]);
+}
+
+function drawHopsak(imgIdx, x, y, r, flip, glow) {
+  const img = IMG['h' + imgIdx];
+  ctx.save(); ctx.translate(x, y); if (flip) ctx.scale(-1, 1);
+  ctx.shadowColor = glow; ctx.shadowBlur = 3 * U;
+  if (img) { const k = r * 2.4 / Math.max(img.width, img.height); ctx.drawImage(img, -img.width * k / 2, -img.height * k / 2, img.width * k, img.height * k); }
+  else { ctx.fillStyle = '#ffb627'; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill(); }
+  ctx.restore();
+}
+
+function drawTarget(t) {
+  const appear = Math.min(1, t.age * 5), out = t.out || 0;
+  const sc = (appear < 1 ? 1.2 * Math.sin(appear * Math.PI / 2) : 1) * (1 - out) * (1 + Math.sin(t.phase * 2) * .04);
+  if (sc <= 0) return;
+  const r = t.r * sc, isFrozen = frozen[t.side] > 0;
+  // podklad – kruh v barvě týmu
+  ctx.save();
+  ctx.globalAlpha = 1 - out;
+  const col = t.kind === 'gold' ? '#ffd21f' : t.kind === 'ice' ? '#9fe6ff' : CONFIG.teams[t.side].color;
+  ctx.fillStyle = col + '66'; ctx.strokeStyle = col; ctx.lineWidth = .9 * U;
+  ctx.beginPath(); ctx.arc(t.x, t.y, r * 1.12, 0, 7); ctx.fill(); ctx.stroke();
+  // ubývající čas
+  const left = Math.max(0, 1 - t.age / t.life);
+  ctx.strokeStyle = 'rgba(255,255,255,.95)'; ctx.lineWidth = .7 * U;
+  ctx.beginPath(); ctx.arc(t.x, t.y, r * 1.12, -Math.PI / 2, -Math.PI / 2 + left * Math.PI * 2); ctx.stroke();
+
+  if (t.kind === 'ice') {
+    const g = ctx.createRadialGradient(t.x - r * .3, t.y - r * .3, r * .1, t.x, t.y, r);
+    g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#5cc8f0');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(t.x, t.y, r * .9, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = .9 * U; ctx.lineCap = 'round';
+    for (let i = 0; i < 6; i++) { const a = i * Math.PI / 3 + t.phase * .2;
+      ctx.beginPath(); ctx.moveTo(t.x, t.y); ctx.lineTo(t.x + Math.cos(a) * r * .65, t.y + Math.sin(a) * r * .65); ctx.stroke(); }
+    ctx.restore();
+    text('NE!', t.x, t.y + r * 1.45, 3.5 * U, '#bfefff');
+    return;
+  }
+  ctx.restore();
+  ctx.globalAlpha = (1 - out) * (isFrozen ? .45 : 1);
+  drawHopsak(t.img, t.x, t.y, r, t.flip, t.kind === 'gold' ? '#ffe14d' : '#ffffff');
+  ctx.globalAlpha = 1;
+  if (t.kind === 'gold') text('×3', t.x + r * .9, t.y - r * .9, 4.5 * U, '#ffe14d');
+}
+
+function drawRope() {
+  const y = 19 * U, x0 = 4 * U, x1 = W - 4 * U, cx = W / 2 + ropeShown * (W / 2 - 14 * U);
+  // cílové zóny
+  for (const s of [0, 1]) {
+    const gx = s ? W - 14 * U : 14 * U;
+    ctx.fillStyle = CONFIG.teams[s].color; ctx.globalAlpha = .9;
+    ctx.fillRect(gx - .6 * U, y - 7 * U, 1.2 * U, 14 * U); ctx.globalAlpha = 1;
+  }
+  // lano
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#7a4a1e'; ctx.lineWidth = 2.6 * U;
+  ctx.beginPath(); ctx.moveTo(x0, y); ctx.quadraticCurveTo(cx, y + 1.5 * U, x1, y); ctx.stroke();
+  ctx.strokeStyle = '#c8894a'; ctx.lineWidth = 1.2 * U; ctx.setLineDash([1.5 * U, 1.5 * U]);
+  ctx.beginPath(); ctx.moveTo(x0, y); ctx.quadraticCurveTo(cx, y + 1.5 * U, x1, y); ctx.stroke(); ctx.setLineDash([]);
+  // střed (šátek)
+  ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = .5 * U;
+  ctx.beginPath(); ctx.moveTo(W / 2, y - 4 * U); ctx.lineTo(W / 2, y + 4 * U); ctx.stroke();
+  ctx.fillStyle = '#e8173a';
+  ctx.beginPath(); ctx.moveTo(cx, y); ctx.lineTo(cx - 2.2 * U, y + 7 * U); ctx.lineTo(cx + 2.2 * U, y + 7 * U); ctx.fill();
+  // maskot na laně
+  const lean = ropeShown * .35 + Math.sin(performance.now() / 180) * .05 * (state === 'play' ? 1 : 0);
+  if (IMG.mascot) {
+    const r = 7 * U, k = r * 2.2 / Math.max(IMG.mascot.width, IMG.mascot.height);
+    ctx.save(); ctx.translate(cx, y - 1 * U); ctx.rotate(lean);
+    ctx.shadowColor = '#fff'; ctx.shadowBlur = 2 * U;
+    ctx.drawImage(IMG.mascot, -IMG.mascot.width * k / 2, -IMG.mascot.height * k * .8, IMG.mascot.width * k, IMG.mascot.height * k);
+    ctx.restore();
+  }
+}
+
+function drawHUD() {
+  for (const s of [0, 1]) {
+    const x = s ? W - 3 * U : 3 * U, al = s ? 'right' : 'left';
+    text(CONFIG.teams[s].name, x, 4.5 * U, 5 * U, CONFIG.teams[s].light, al);
+    if (state === 'play' || state === 'end') text('tahů: ' + hits[s], x, 30 * U, 3.5 * U, '#fff', al);
+    if (state === 'play' && frozen[s] > 0) text('ZAMRZLÍ!', s ? W * .75 : W * .25, 72 * U, 9 * U, '#bfefff');
+  }
+  if (state === 'play' || state === 'countdown') {
+    const t = state === 'play' ? Math.ceil(timeLeft) : CONFIG.roundSeconds;
+    text(t + ' s', W / 2, 30 * U, 4.5 * U, finale() ? '#ffe14d' : '#fff');
+  }
+}
+
+function drawFx() {
+  for (const p of parts) { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  for (const r of ripples) {
+    ctx.strokeStyle = `rgba(255,255,255,${r.life * .9})`; ctx.lineWidth = .7 * U;
+    ctx.beginPath(); ctx.arc(r.x, r.y, (1 - r.life) * 7 * U + U, 0, 7); ctx.stroke();
+  }
+  for (const p of pops) { ctx.globalAlpha = Math.min(1, p.life * 2); text(p.text, p.x, p.y, p.size, p.color); }
+  ctx.globalAlpha = 1;
+  for (const c of confetti) { ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.rot); ctx.fillStyle = c.color; ctx.fillRect(-c.s, -c.s / 2, c.s * 2, c.s); ctx.restore(); }
+}
+
+function readyPos(s) { return { x: s ? W * .75 : W * .25, y: 58 * U }; }
+
+function drawReady(t) {
+  text('PŘETAHOVANÁ', W / 2, 34 * U, 11 * U, '#ffe14d');
+  for (const s of [0, 1]) {
+    const p = readyPos(s), r = 13 * U * (ready[s] ? 1 : 1 + Math.sin(t / 250 + s) * .06);
+    ctx.fillStyle = CONFIG.teams[s].color + (ready[s] ? 'cc' : '77');
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1 * U;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.fill(); ctx.stroke();
+    drawHopsak(s ? 8 : 2, p.x, p.y - r * .1, r * .62, s === 1, '#fff');
+    text(CONFIG.teams[s].name, p.x, p.y - r - 4 * U, 6 * U, CONFIG.teams[s].light);
+    text(ready[s] ? '✓ PŘIPRAVENI' : 'Ťukněte sem!', p.x, p.y + r + 5 * U, 5 * U, ready[s] ? '#3ddc84' : '#fff');
+  }
+  if (readySince) {
+    const left = Math.ceil(CONFIG.readyWait - (stateT - readySince));
+    text('Čekáme na druhý tým… ' + left, W / 2, 92 * U, 4 * U);
+  } else text('Levá strana proti pravé – chytejte Hopsáky na své polovině!', W / 2, 92 * U, 4 * U);
+  if (IMG.logo) { const h = 9 * U, w = h * IMG.logo.width / IMG.logo.height; ctx.drawImage(IMG.logo, (W - w) / 2, 22 * U - h, w, h); }
+}
+
+function render(t) {
+  drawBackground();
+  if (state === 'ready') { drawReady(t); drawFx(); return; }
+  drawRope();
+  for (const tg of targets) drawTarget(tg);
+  drawHUD();
+  if (state === 'countdown') {
+    const n = 3 - Math.floor(stateT);
+    text('Chytejte Hopsáky na své polovině!', W / 2, 40 * U, 5.5 * U);
+    text(n > 0 ? String(n) : 'TÁHNĚTE!', W / 2, 62 * U, 20 * U * (1.3 - (stateT % 1) * .3), '#ffe14d');
+  }
+  if (state === 'end') {
+    ctx.fillStyle = 'rgba(10,30,80,.35)'; ctx.fillRect(0, 0, W, H);
+    if (winner === null) text('REMÍZA!', W / 2, 45 * U, 14 * U, '#ffe14d');
+    else {
+      const tm = CONFIG.teams[winner];
+      text('VYHRÁLI ' + tm.name + '!', W / 2, 42 * U, 12 * U, tm.light);
+      text('Gratulujeme!', W / 2, 58 * U, 6 * U);
+    }
+    if (stateT > 4) text('Zásahem do stěny hrajete znovu', W / 2, 80 * U, 5 * U * (1 + Math.sin(t / 250) * .05));
+  }
+  drawFx();
+  if (debug) text(`${Math.round(W)}×${Math.round(H)}  lano: ${rope.toFixed(2)}  stav: ${state}`, 2 * U, H - 3 * U, 2.5 * U, '#fff', 'left');
+}
+
+/* ---------- SMYČKA ---------- */
+let last = performance.now();
+function loop(t) {
+  const dt = Math.min(.05, (t - last) / 1000); last = t;
+  update(dt); render(t);
+  requestAnimationFrame(loop);
+}
+resetReady();
+requestAnimationFrame(loop);
+
+/* ---------- VSTUP ---------- */
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault(); audioInit();
+  const r = cv.getBoundingClientRect();
+  onHit(e.clientX - r.left, e.clientY - r.top);
+}, { passive: false });
+['contextmenu', 'touchstart', 'touchmove', 'gesturestart', 'dblclick'].forEach(ev =>
+  document.addEventListener(ev, e => e.preventDefault(), { passive: false }));
+addEventListener('keydown', e => {
+  if (e.key === 'f' || e.key === 'F') { if (!document.fullscreenElement) document.documentElement.requestFullscreen?.(); else document.exitFullscreen?.(); }
+  if (e.key === 'd' || e.key === 'D') debug = !debug;
+});
+</script>
+</body>
+</html>
